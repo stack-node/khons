@@ -4,6 +4,47 @@ import Foundation
 
 @MainActor
 final class KhonsViewModel: ObservableObject {
+    enum RouteAnchorLock: Equatable {
+        case target
+        case waypoint(Int)
+    }
+
+    enum RouteEndBehavior: String, CaseIterable, Identifiable {
+        case stayAtDestination = "Stay at destination"
+        case returnToOrigin = "Return to origin"
+        case reverse = "Reverse"
+        case loop = "Loop"
+        case reverseLoop = "Reverse loop"
+
+        var id: String { rawValue }
+
+        var requiresLoopCount: Bool {
+            self == .loop || self == .reverseLoop
+        }
+    }
+
+    enum LoopCountOption: String, CaseIterable, Identifiable {
+        case one = "1x"
+        case two = "2x"
+        case three = "3x"
+        case five = "5x"
+        case ten = "10x"
+        case infinite = "Infinite"
+
+        var id: String { rawValue }
+
+        var cycleCount: Int? {
+            switch self {
+            case .one: return 1
+            case .two: return 2
+            case .three: return 3
+            case .five: return 5
+            case .ten: return 10
+            case .infinite: return nil
+            }
+        }
+    }
+
     enum ToolGroup: String, CaseIterable, Identifiable {
         case legacyIOS = "< iOS 17"
         case modernIOS = ">= iOS 17"
@@ -26,7 +67,17 @@ final class KhonsViewModel: ObservableObject {
     @Published var selectedToolGroup: ToolGroup = .modernIOS
     @Published var dependenciesInstalled = false
     @Published var targetCoordinate = CLLocationCoordinate2D(latitude: 37.3349, longitude: -122.0090)
+    @Published var travelCoordinates: [CLLocationCoordinate2D] = []
     @Published var simulatedCoordinate: CLLocationCoordinate2D?
+    @Published var isTraveling = false
+    @Published var isTravelPaused = false
+    @Published var lockedRouteAnchor: RouteAnchorLock?
+    @Published var selectedRouteEndBehavior: RouteEndBehavior = .stayAtDestination
+    @Published var selectedLoopCount: LoopCountOption = .infinite
+
+    private let travelStepCount = 40
+    private let travelStepDelayNanoseconds: UInt64 = 1_000_000_000
+    private var travelTask: Task<Void, Never>?
 
     init() {
         refreshToolPaths()
@@ -166,6 +217,84 @@ final class KhonsViewModel: ObservableObject {
         longitudeText = formatCoord(coordinate.longitude)
     }
 
+    func handleMapCoordinateSelection(_ coordinate: CLLocationCoordinate2D) {
+        guard isValidCoordinate(latitude: coordinate.latitude, longitude: coordinate.longitude) else {
+            return
+        }
+
+        switch lockedRouteAnchor {
+        case .target:
+            setTravelCoordinate(after: nil, to: coordinate)
+            statusMessage = "Created or updated P1 from the locked target."
+        case .waypoint(let index):
+            setTravelCoordinate(after: index, to: coordinate)
+            statusMessage = "Created or updated P\(index + 2) from the locked waypoint."
+        case nil:
+            setTargetCoordinate(coordinate)
+        }
+    }
+
+    func toggleRouteAnchorLock(_ anchor: RouteAnchorLock) {
+        if lockedRouteAnchor == anchor {
+            lockedRouteAnchor = nil
+        } else {
+            lockedRouteAnchor = anchor
+        }
+    }
+
+    func isRouteAnchorLocked(_ anchor: RouteAnchorLock) -> Bool {
+        lockedRouteAnchor == anchor
+    }
+
+    func lockLatestRouteAnchor() {
+        if let lastIndex = travelCoordinates.indices.last {
+            lockedRouteAnchor = .waypoint(lastIndex)
+            statusMessage = "Locked latest waypoint P\(lastIndex + 1). The next map click creates P\(lastIndex + 2)."
+        } else {
+            lockedRouteAnchor = .target
+            statusMessage = "Locked target. The next map click creates P1."
+        }
+    }
+
+    func setTravelCoordinate(after anchorIndex: Int?, to coordinate: CLLocationCoordinate2D) {
+        guard isValidCoordinate(latitude: coordinate.latitude, longitude: coordinate.longitude) else {
+            return
+        }
+        let insertionIndex = (anchorIndex ?? -1) + 1
+        if insertionIndex < travelCoordinates.count {
+            travelCoordinates[insertionIndex] = coordinate
+        } else {
+            travelCoordinates.append(coordinate)
+        }
+    }
+
+    func removeTravelCoordinate(at index: Int) {
+        guard travelCoordinates.indices.contains(index) else {
+            return
+        }
+        travelCoordinates.remove(at: index)
+        switch lockedRouteAnchor {
+        case .waypoint(let lockedIndex) where lockedIndex == index:
+            lockedRouteAnchor = nil
+        case .waypoint(let lockedIndex) where lockedIndex > index:
+            lockedRouteAnchor = .waypoint(lockedIndex - 1)
+        default:
+            break
+        }
+    }
+
+    var hasTravelRoute: Bool {
+        !travelCoordinates.isEmpty
+    }
+
+    var routeCoordinates: [CLLocationCoordinate2D] {
+        [targetCoordinate] + travelCoordinates
+    }
+
+    func coordinateDescription(for coordinate: CLLocationCoordinate2D) -> String {
+        "\(formatCoord(coordinate.latitude)), \(formatCoord(coordinate.longitude))"
+    }
+
     func syncTargetFromTextFields() {
         guard
             let lat = Double(latitudeText.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -188,46 +317,79 @@ final class KhonsViewModel: ObservableObject {
             statusMessage = "Latitude must be −90…90 and longitude −180…180."
             return
         }
-        let udid = resolvedTargetUDID()
-        if deviceUDIDs.count > 1, udid == nil {
-            statusMessage = "Select a device."
+
+        let target = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        targetCoordinate = target
+
+        guard validateSimulationTargetSelection() else {
             return
         }
 
-        isBusy = true
-        statusMessage = "Setting location…"
-        let effectiveResult: LocationToolRunner.RunResult
-        switch selectedToolGroup {
-        case .legacyIOS:
-            guard let tool = idevicesetlocationPath else {
-                refreshToolPaths()
-                isBusy = false
-                statusMessage = "idevicesetlocation not found."
-                return
-            }
-            let url = URL(fileURLWithPath: tool)
-            let result = await LocationToolRunner.setLocation(
-                idevicesetlocation: url,
-                udid: udid,
-                latitude: lat,
-                longitude: lon
-            )
-            effectiveResult = result
-        case .modernIOS:
-            effectiveResult = await LocationToolRunner.startIOS17LocationSimulation(
-                udid: udid,
-                latitude: lat,
-                longitude: lon
+        if hasTravelRoute {
+            startTravel()
+        } else {
+            await setStaticSimulatedLocation(to: target)
+        }
+    }
+
+    func startTravel() {
+        let route = routeCoordinates
+        guard route.count > 1 else {
+            statusMessage = "Create a travel point by dragging out from the target pin."
+            return
+        }
+        guard validateSimulationTargetSelection() else {
+            return
+        }
+
+        cancelTravelLoop(markPaused: false)
+        isTraveling = true
+        isTravelPaused = false
+        statusMessage = "Starting travel simulation…"
+
+        let plan = buildTravelPlan(from: route)
+        let initialState = travelState(for: simulatedCoordinate, path: plan.path)
+
+        travelTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runTravelLoop(
+                path: plan.path,
+                repeatsInfinitely: plan.repeatsInfinitely,
+                completionMessage: plan.completionMessage,
+                initialSegmentIndex: initialState.segmentIndex,
+                initialProgress: initialState.progress
             )
         }
+    }
+
+    func pauseTravel() {
+        guard isTraveling else {
+            return
+        }
+        cancelTravelLoop(markPaused: true)
+        let coordinate = simulatedCoordinate ?? targetCoordinate
+        statusMessage = """
+        Travel paused at \(formatCoord(coordinate.latitude)), \(formatCoord(coordinate.longitude)).
+        """
+    }
+
+    private func setStaticSimulatedLocation(to coordinate: CLLocationCoordinate2D) async {
+        cancelTravelLoop(markPaused: false)
+        isBusy = true
+        statusMessage = "Setting location…"
+        let effectiveResult = await applyLocationSimulation(to: coordinate)
         isBusy = false
         if effectiveResult.exitCode == 0 {
-            targetCoordinate = CLLocationCoordinate2D(latitude: lat, longitude: lon)
-            simulatedCoordinate = targetCoordinate
+            targetCoordinate = coordinate
+            simulatedCoordinate = coordinate
+            isTravelPaused = false
             if selectedToolGroup == .modernIOS {
-                statusMessage = "Location set to \(lat), \(lon). Keep Khons open while iOS 17+ simulation is active."
+                statusMessage = """
+                Location set to \(formatCoord(coordinate.latitude)), \(formatCoord(coordinate.longitude)).
+                Keep Khons open while iOS 17+ simulation is active.
+                """
             } else {
-                statusMessage = "Location set to \(lat), \(lon)."
+                statusMessage = "Location set to \(formatCoord(coordinate.latitude)), \(formatCoord(coordinate.longitude))."
             }
         } else {
             let detail = [effectiveResult.stdout, effectiveResult.stderr].joined().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -238,7 +400,137 @@ final class KhonsViewModel: ObservableObject {
         }
     }
 
+    private func runTravelLoop(
+        path: [CLLocationCoordinate2D],
+        repeatsInfinitely: Bool,
+        completionMessage: String,
+        initialSegmentIndex: Int,
+        initialProgress: Double
+    ) async {
+        guard path.count > 1 else {
+            cancelTravelLoop(markPaused: false)
+            return
+        }
+
+        var segmentIndex = initialSegmentIndex
+        var progress = initialProgress
+
+        if simulatedCoordinate == nil {
+            let initialResult = await applyLocationSimulation(to: path[0])
+            if initialResult.exitCode == 0 {
+                simulatedCoordinate = path[0]
+            } else {
+                finishTravelWithError(initialResult)
+                return
+            }
+        }
+
+        while !Task.isCancelled {
+            let delta = 1.0 / Double(travelStepCount)
+            let segmentStart = path[segmentIndex]
+            let segmentEnd = path[segmentIndex + 1]
+            progress = min(1, progress + delta)
+
+            let nextCoordinate = interpolate(from: segmentStart, to: segmentEnd, progress: progress)
+            let result = await applyLocationSimulation(to: nextCoordinate)
+            if result.exitCode != 0 {
+                finishTravelWithError(result)
+                return
+            }
+
+            simulatedCoordinate = nextCoordinate
+            statusMessage = """
+            Traveling… \(coordinateDescription(for: nextCoordinate))
+            """
+
+            if progress >= 1 {
+                if segmentIndex >= path.count - 2 {
+                    if repeatsInfinitely {
+                        segmentIndex = 0
+                        progress = 0
+                    } else {
+                        finishTravelNormally(message: completionMessage)
+                        return
+                    }
+                } else {
+                    segmentIndex += 1
+                    progress = 0
+                }
+            }
+
+            do {
+                try await Task.sleep(nanoseconds: travelStepDelayNanoseconds)
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func finishTravelWithError(_ result: LocationToolRunner.RunResult) {
+        cancelTravelLoop(markPaused: true)
+        let detail = [result.stdout, result.stderr].joined().trimmingCharacters(in: .whitespacesAndNewlines)
+        statusMessage = interpretedLocationFailureMessage(
+            detail: detail,
+            fallback: "Travel simulation failed (exit \(result.exitCode))."
+        )
+    }
+
+    private func finishTravelNormally(message: String) {
+        travelTask = nil
+        isTraveling = false
+        isTravelPaused = false
+        statusMessage = message
+    }
+
+    private func cancelTravelLoop(markPaused: Bool) {
+        travelTask?.cancel()
+        travelTask = nil
+        isTraveling = false
+        isTravelPaused = markPaused
+    }
+
+    private func validateSimulationTargetSelection() -> Bool {
+        let udid = resolvedTargetUDID()
+        if deviceUDIDs.count > 1, udid == nil {
+            statusMessage = "Select a device."
+            return false
+        }
+        return true
+    }
+
+    private func applyLocationSimulation(to coordinate: CLLocationCoordinate2D) async -> LocationToolRunner.RunResult {
+        let udid = resolvedTargetUDID()
+        let effectiveResult: LocationToolRunner.RunResult
+        switch selectedToolGroup {
+        case .legacyIOS:
+            guard let tool = idevicesetlocationPath else {
+                refreshToolPaths()
+                return LocationToolRunner.RunResult(
+                    exitCode: 1,
+                    stdout: "",
+                    stderr: "idevicesetlocation not found."
+                )
+            }
+            let url = URL(fileURLWithPath: tool)
+            let result = await LocationToolRunner.setLocation(
+                idevicesetlocation: url,
+                udid: udid,
+                latitude: coordinate.latitude,
+                longitude: coordinate.longitude
+            )
+            effectiveResult = result
+        case .modernIOS:
+            effectiveResult = await LocationToolRunner.startIOS17LocationSimulation(
+                udid: udid,
+                latitude: coordinate.latitude,
+                longitude: coordinate.longitude
+            )
+        }
+        return effectiveResult
+    }
+
     func resetLocation() async {
+        cancelTravelLoop(markPaused: false)
         let udid = resolvedTargetUDID()
         if deviceUDIDs.count > 1, udid == nil {
             statusMessage = "Select a device."
@@ -263,6 +555,7 @@ final class KhonsViewModel: ObservableObject {
         isBusy = false
         if effectiveResult.exitCode == 0 {
             simulatedCoordinate = nil
+            isTravelPaused = false
             statusMessage = "Location simulation reset."
         } else {
             let detail = [effectiveResult.stdout, effectiveResult.stderr].joined().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -284,6 +577,126 @@ final class KhonsViewModel: ObservableObject {
 
     private func isValidCoordinate(latitude: Double, longitude: Double) -> Bool {
         (-90...90).contains(latitude) && (-180...180).contains(longitude)
+    }
+
+    private func interpolate(
+        from start: CLLocationCoordinate2D,
+        to end: CLLocationCoordinate2D,
+        progress: Double
+    ) -> CLLocationCoordinate2D {
+        CLLocationCoordinate2D(
+            latitude: start.latitude + ((end.latitude - start.latitude) * progress),
+            longitude: start.longitude + ((end.longitude - start.longitude) * progress)
+        )
+    }
+
+    private func travelState(
+        for coordinate: CLLocationCoordinate2D?,
+        path: [CLLocationCoordinate2D]
+    ) -> (segmentIndex: Int, progress: Double) {
+        guard let coordinate, path.count > 1 else {
+            return (0, 0)
+        }
+
+        var bestSegmentIndex = 0
+        var bestProgress = 0.0
+        var bestDistanceSquared = Double.greatestFiniteMagnitude
+
+        for segmentIndex in 0..<(path.count - 1) {
+            let start = path[segmentIndex]
+            let end = path[segmentIndex + 1]
+            let deltaLatitude = end.latitude - start.latitude
+            let deltaLongitude = end.longitude - start.longitude
+            let segmentLengthSquared = (deltaLatitude * deltaLatitude) + (deltaLongitude * deltaLongitude)
+            guard segmentLengthSquared > 0 else {
+                continue
+            }
+
+            let progress = min(
+                1,
+                max(
+                    0,
+                    (
+                        ((coordinate.latitude - start.latitude) * deltaLatitude) +
+                        ((coordinate.longitude - start.longitude) * deltaLongitude)
+                    ) / segmentLengthSquared
+                )
+            )
+            let projected = interpolate(from: start, to: end, progress: progress)
+            let distanceSquared =
+                pow(projected.latitude - coordinate.latitude, 2) +
+                pow(projected.longitude - coordinate.longitude, 2)
+
+            if distanceSquared < bestDistanceSquared {
+                bestDistanceSquared = distanceSquared
+                bestSegmentIndex = segmentIndex
+                bestProgress = progress
+            }
+        }
+
+        return (bestSegmentIndex, bestProgress)
+    }
+
+    private func buildTravelPlan(from route: [CLLocationCoordinate2D]) -> (
+        path: [CLLocationCoordinate2D],
+        repeatsInfinitely: Bool,
+        completionMessage: String
+    ) {
+        let origin = route[0]
+
+        switch selectedRouteEndBehavior {
+        case .stayAtDestination:
+            return (
+                path: route,
+                repeatsInfinitely: false,
+                completionMessage: "Arrived at the final destination."
+            )
+        case .returnToOrigin:
+            return (
+                path: route + [origin],
+                repeatsInfinitely: false,
+                completionMessage: "Returned to the route origin."
+            )
+        case .reverse:
+            return (
+                path: route + Array(route.dropLast().reversed()),
+                repeatsInfinitely: false,
+                completionMessage: "Ran the route in reverse back to the origin."
+            )
+        case .loop:
+            let cycle = route + [origin]
+            return (
+                path: repeatedPath(from: cycle, count: selectedLoopCount.cycleCount),
+                repeatsInfinitely: selectedLoopCount.cycleCount == nil,
+                completionMessage: selectedLoopCount.cycleCount == nil
+                    ? "Looping route."
+                    : "Completed \(selectedLoopCount.rawValue) of the route loop."
+            )
+        case .reverseLoop:
+            let cycle = route + Array(route.dropLast().reversed())
+            return (
+                path: repeatedPath(from: cycle, count: selectedLoopCount.cycleCount),
+                repeatsInfinitely: selectedLoopCount.cycleCount == nil,
+                completionMessage: selectedLoopCount.cycleCount == nil
+                    ? "Reverse looping route."
+                    : "Completed \(selectedLoopCount.rawValue) of the reverse loop."
+            )
+        }
+    }
+
+    private func repeatedPath(from cycle: [CLLocationCoordinate2D], count: Int?) -> [CLLocationCoordinate2D] {
+        guard let count else {
+            return cycle
+        }
+        guard count > 1 else {
+            return cycle
+        }
+
+        var path = cycle
+        for _ in 2...count {
+            path.append(contentsOf: cycle.dropFirst())
+        }
+        return path
     }
 
     private func interpretedLocationFailureMessage(detail: String, fallback: String) -> String {

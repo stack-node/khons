@@ -27,15 +27,23 @@ struct ContentView: View {
             MacMapView(
                 region: cameraRegion,
                 targetCoordinate: model.targetCoordinate,
+                travelCoordinates: model.travelCoordinates,
                 simulatedCoordinate: model.simulatedCoordinate,
                 onCoordinateSelected: { coordinate in
-                    model.setTargetCoordinate(coordinate)
+                    model.handleMapCoordinateSelection(coordinate)
+                },
+                onTravelCoordinateUpdated: { anchorIndex, coordinate in
+                    model.setTravelCoordinate(after: anchorIndex, to: coordinate)
                 },
                 onRegionChanged: { region in
                     cameraRegion = region
                 }
             )
             .ignoresSafeArea()
+        }
+        .overlay(alignment: .topLeading) {
+            routePanel
+                .padding(12)
         }
         .overlay(alignment: .bottomLeading) {
             if !model.statusMessage.isEmpty {
@@ -132,7 +140,21 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(model.isBusy)
-                .help("Set simulated location")
+                .help(model.hasTravelRoute ? "Start or resume travel simulation" : "Set simulated location")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    model.pauseTravel()
+                } label: {
+                    Image(systemName: "pause.fill")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 30, height: 30)
+                        .background(.yellow.opacity(0.95), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.isTraveling)
+                .help("Pause travel at the current spoofed location")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -270,6 +292,138 @@ struct ContentView: View {
         .shadow(color: .black.opacity(0.2), radius: 18, x: 0, y: 8)
     }
 
+    private var routePanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
+                Text("Route")
+                    .font(.caption.weight(.semibold))
+
+                Spacer(minLength: 0)
+
+                Button {
+                    model.lockLatestRouteAnchor()
+                } label: {
+                    Image(systemName: "lock.fill")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .frame(width: 24, height: 24)
+                        .background(.white.opacity(0.14), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: [])
+                .help("Lock the latest route point. Press Return to use this.")
+
+                Menu {
+                    ForEach(KhonsViewModel.RouteEndBehavior.allCases) { behavior in
+                        Button {
+                            model.selectedRouteEndBehavior = behavior
+                        } label: {
+                            if model.selectedRouteEndBehavior == behavior {
+                                Label(behavior.rawValue, systemImage: "checkmark")
+                            } else {
+                                Text(behavior.rawValue)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(model.selectedRouteEndBehavior.rawValue)
+                            .font(.caption2.weight(.semibold))
+                        Image(systemName: "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.white.opacity(0.08), in: Capsule())
+                }
+                .menuStyle(.borderlessButton)
+
+                if model.selectedRouteEndBehavior.requiresLoopCount {
+                    Menu {
+                        ForEach(KhonsViewModel.LoopCountOption.allCases) { option in
+                            Button {
+                                model.selectedLoopCount = option
+                            } label: {
+                                if model.selectedLoopCount == option {
+                                    Label(option.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(option.rawValue)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(model.selectedLoopCount.rawValue)
+                                .font(.caption2.weight(.semibold))
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.white.opacity(0.08), in: Capsule())
+                    }
+                    .menuStyle(.borderlessButton)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    centerCamera(on: model.targetCoordinate)
+                } label: {
+                    routeRowLabel(
+                        title: "Target",
+                        detail: model.coordinateDescription(for: model.targetCoordinate),
+                        tint: .blue,
+                        isLocked: model.isRouteAnchorLocked(.target)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+
+            ForEach(Array(model.travelCoordinates.enumerated()), id: \.offset) { index, coordinate in
+                HStack(spacing: 8) {
+                    Button {
+                        centerCamera(on: coordinate)
+                    } label: {
+                        routeRowLabel(
+                            title: "P\(index + 1)",
+                            detail: model.coordinateDescription(for: coordinate),
+                            tint: .teal,
+                            isLocked: model.isRouteAnchorLocked(.waypoint(index))
+                        )
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        model.removeTravelCoordinate(at: index)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .frame(width: 24, height: 24)
+                            .background(.red.opacity(0.85), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Delete this travel point")
+                }
+            }
+
+            if model.travelCoordinates.isEmpty {
+                Text("Lock the target, then click the map to create P1. Lock P1, then click to create P2, and so on. Press Return to lock the newest point.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 220, alignment: .leading)
+            }
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.18), lineWidth: 1)
+        )
+        .frame(maxWidth: 290, alignment: .leading)
+    }
+
     private var statusOverlay: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Status")
@@ -299,13 +453,38 @@ struct ContentView: View {
         let coordinate = model.simulatedCoordinate ?? model.targetCoordinate
         return String(format: "Lat %.6f, Lon %.6f", coordinate.latitude, coordinate.longitude)
     }
+
+    private func routeRowLabel(title: String, detail: String, tint: Color, isLocked: Bool) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(tint)
+                .frame(width: 9, height: 9)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Text(detail)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            (isLocked ? tint.opacity(0.18) : .white.opacity(0.08)),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+    }
 }
 
 private struct MacMapView: NSViewRepresentable {
     let region: MKCoordinateRegion
     let targetCoordinate: CLLocationCoordinate2D
+    let travelCoordinates: [CLLocationCoordinate2D]
     let simulatedCoordinate: CLLocationCoordinate2D?
     let onCoordinateSelected: (CLLocationCoordinate2D) -> Void
+    let onTravelCoordinateUpdated: (Int?, CLLocationCoordinate2D) -> Void
     let onRegionChanged: (MKCoordinateRegion) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -324,15 +503,31 @@ private struct MacMapView: NSViewRepresentable {
         mapView.showsZoomControls = false
         mapView.showsScale = false
         mapView.onCoordinateSelected = onCoordinateSelected
+        mapView.onTravelCoordinateUpdated = onTravelCoordinateUpdated
+        mapView.targetCoordinate = targetCoordinate
+        mapView.travelCoordinates = travelCoordinates
         mapView.setRegion(region, animated: false)
-        context.coordinator.syncAnnotations(on: mapView, target: targetCoordinate, simulated: simulatedCoordinate)
+        context.coordinator.syncAnnotations(
+            on: mapView,
+            target: targetCoordinate,
+            travelCoordinates: travelCoordinates,
+            simulated: simulatedCoordinate
+        )
         return mapView
     }
 
     func updateNSView(_ mapView: ClickSelectableMapView, context: Context) {
         mapView.onCoordinateSelected = onCoordinateSelected
+        mapView.onTravelCoordinateUpdated = onTravelCoordinateUpdated
+        mapView.targetCoordinate = targetCoordinate
+        mapView.travelCoordinates = travelCoordinates
         context.coordinator.onRegionChanged = onRegionChanged
-        context.coordinator.syncAnnotations(on: mapView, target: targetCoordinate, simulated: simulatedCoordinate)
+        context.coordinator.syncAnnotations(
+            on: mapView,
+            target: targetCoordinate,
+            travelCoordinates: travelCoordinates,
+            simulated: simulatedCoordinate
+        )
 
         if !context.coordinator.isRegion(mapView.region, approximatelyEqualTo: region) {
             context.coordinator.isProgrammaticRegionChange = true
@@ -360,19 +555,41 @@ private struct MacMapView: NSViewRepresentable {
             }
         }
 
-        func syncAnnotations(on mapView: MKMapView, target: CLLocationCoordinate2D, simulated: CLLocationCoordinate2D?) {
+        func syncAnnotations(
+            on mapView: MKMapView,
+            target: CLLocationCoordinate2D,
+            travelCoordinates: [CLLocationCoordinate2D],
+            simulated: CLLocationCoordinate2D?
+        ) {
             let existing = mapView.annotations.filter { !($0 is MKUserLocation) }
             mapView.removeAnnotations(existing)
+            let overlays = mapView.overlays
+            mapView.removeOverlays(overlays)
 
-            let targetAnnotation = MKPointAnnotation()
-            targetAnnotation.title = "Target"
-            targetAnnotation.coordinate = target
+            let targetAnnotation = RoutePinAnnotation(kind: .target, title: "Target", coordinate: target)
             mapView.addAnnotation(targetAnnotation)
 
+            for (index, coordinate) in travelCoordinates.enumerated() {
+                let travelAnnotation = RoutePinAnnotation(
+                    kind: .travel(index),
+                    title: "Travel point \(index + 1)",
+                    coordinate: coordinate
+                )
+                mapView.addAnnotation(travelAnnotation)
+            }
+
+            if !travelCoordinates.isEmpty {
+                let coordinates = [target] + travelCoordinates
+                let routeLine = MKPolyline(coordinates: coordinates, count: coordinates.count)
+                mapView.addOverlay(routeLine)
+            }
+
             if let simulated {
-                let simulatedAnnotation = MKPointAnnotation()
-                simulatedAnnotation.title = "Device (simulated)"
-                simulatedAnnotation.coordinate = simulated
+                let simulatedAnnotation = RoutePinAnnotation(
+                    kind: .simulated,
+                    title: "Device (simulated)",
+                    coordinate: simulated
+                )
                 mapView.addAnnotation(simulatedAnnotation)
             }
         }
@@ -381,13 +598,67 @@ private struct MacMapView: NSViewRepresentable {
             if annotation is MKUserLocation {
                 return nil
             }
-            let identifier = "marker"
-            let view = (mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? MKMarkerAnnotationView)
-                ?? MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: identifier)
-            view.annotation = annotation
-            view.canShowCallout = false
-            view.markerTintColor = annotation.title??.contains("simulated") == true ? .systemOrange : .systemBlue
-            return view
+            guard let pinAnnotation = annotation as? RoutePinAnnotation else {
+                return nil
+            }
+
+            switch pinAnnotation.kind {
+            case .target:
+                let identifier = "target-marker"
+                let view = (mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? RouteAnchorMarkerAnnotationView)
+                    ?? RouteAnchorMarkerAnnotationView(annotation: pinAnnotation, reuseIdentifier: identifier)
+                view.annotation = pinAnnotation
+                view.configure(
+                    tintColor: NSColor.systemBlue,
+                    dragHandler: { [weak mapView = mapView as? ClickSelectableMapView] (point: NSPoint) in
+                        guard let mapView else { return }
+                        let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
+                        mapView.onTravelCoordinateUpdated?(nil, coordinate)
+                    }
+                )
+                return view
+            case .simulated:
+                let identifier = "simulated-marker"
+                let view = (mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? MKMarkerAnnotationView)
+                    ?? MKMarkerAnnotationView(annotation: pinAnnotation, reuseIdentifier: identifier)
+                view.annotation = pinAnnotation
+                view.canShowCallout = false
+                view.markerTintColor = NSColor.systemOrange
+                view.glyphImage = nil
+                return view
+            case .travel:
+                let identifier = "travel-marker"
+                let view = (mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? RouteAnchorDotAnnotationView)
+                    ?? RouteAnchorDotAnnotationView(annotation: pinAnnotation, reuseIdentifier: identifier)
+                view.annotation = pinAnnotation
+                let anchorIndex: Int?
+                if case let .travel(index) = pinAnnotation.kind {
+                    anchorIndex = index
+                } else {
+                    anchorIndex = nil
+                }
+                view.configure(
+                    image: endpointImage,
+                    dragHandler: { [weak mapView = mapView as? ClickSelectableMapView] (point: NSPoint) in
+                        guard let mapView else { return }
+                        let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
+                        mapView.onTravelCoordinateUpdated?(anchorIndex, coordinate)
+                    }
+                )
+                return view
+            }
+        }
+
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            guard let polyline = overlay as? MKPolyline else {
+                return MKOverlayRenderer(overlay: overlay)
+            }
+            let renderer = MKPolylineRenderer(polyline: polyline)
+            renderer.strokeColor = .systemTeal
+            renderer.lineWidth = 2
+            renderer.lineDashPattern = [5, 4]
+            renderer.alpha = 0.9
+            return renderer
         }
 
         func isRegion(_ lhs: MKCoordinateRegion, approximatelyEqualTo rhs: MKCoordinateRegion) -> Bool {
@@ -396,16 +667,57 @@ private struct MacMapView: NSViewRepresentable {
             abs(lhs.span.latitudeDelta - rhs.span.latitudeDelta) < 0.000_001 &&
             abs(lhs.span.longitudeDelta - rhs.span.longitudeDelta) < 0.000_001
         }
+
+        private var endpointImage: NSImage {
+            let size = NSSize(width: 14, height: 14)
+            let image = NSImage(size: size)
+            image.lockFocus()
+            let circleRect = NSRect(origin: .zero, size: size)
+            NSColor.systemTeal.setFill()
+            NSBezierPath(ovalIn: circleRect).fill()
+            NSColor.white.withAlphaComponent(0.8).setStroke()
+            let outline = NSBezierPath(ovalIn: circleRect.insetBy(dx: 1, dy: 1))
+            outline.lineWidth = 1
+            outline.stroke()
+            image.unlockFocus()
+            return image
+        }
     }
+}
+
+private enum RouteAnnotationKind {
+    case target
+    case travel(Int)
+    case simulated
+}
+
+private final class RoutePinAnnotation: NSObject, MKAnnotation {
+    let kind: RouteAnnotationKind
+    let titleText: String
+    dynamic var coordinate: CLLocationCoordinate2D
+
+    init(kind: RouteAnnotationKind, title: String, coordinate: CLLocationCoordinate2D) {
+        self.kind = kind
+        self.titleText = title
+        self.coordinate = coordinate
+    }
+
+    var title: String? { titleText }
 }
 
 private final class ClickSelectableMapView: MKMapView {
     var onCoordinateSelected: ((CLLocationCoordinate2D) -> Void)?
+    var onTravelCoordinateUpdated: ((Int?, CLLocationCoordinate2D) -> Void)?
+    var targetCoordinate = CLLocationCoordinate2D(latitude: 37.3349, longitude: -122.0090)
+    var travelCoordinates: [CLLocationCoordinate2D] = []
     private var mouseDownLocation: NSPoint?
+    private var mouseDownTimestamp: TimeInterval?
     private let clickTolerance: CGFloat = 4
+    private let holdDurationThreshold: TimeInterval = 0.35
 
     override func mouseDown(with event: NSEvent) {
         mouseDownLocation = convert(event.locationInWindow, from: nil)
+        mouseDownTimestamp = event.timestamp
         super.mouseDown(with: event)
     }
 
@@ -413,11 +725,20 @@ private final class ClickSelectableMapView: MKMapView {
         let mouseUpLocation = convert(event.locationInWindow, from: nil)
         let shouldSelect: Bool
         if let mouseDownLocation {
-            shouldSelect = hypot(mouseUpLocation.x - mouseDownLocation.x, mouseUpLocation.y - mouseDownLocation.y) <= clickTolerance
+            let heldLongEnough: Bool
+            if let mouseDownTimestamp {
+                heldLongEnough = (event.timestamp - mouseDownTimestamp) >= holdDurationThreshold
+            } else {
+                heldLongEnough = false
+            }
+            shouldSelect =
+                hypot(mouseUpLocation.x - mouseDownLocation.x, mouseUpLocation.y - mouseDownLocation.y) <= clickTolerance &&
+                heldLongEnough
         } else {
             shouldSelect = false
         }
         mouseDownLocation = nil
+        mouseDownTimestamp = nil
 
         super.mouseUp(with: event)
 
@@ -426,9 +747,73 @@ private final class ClickSelectableMapView: MKMapView {
             onCoordinateSelected?(coordinate)
         }
     }
+}
+
+private final class RouteAnchorMarkerAnnotationView: MKMarkerAnnotationView {
+    private var dragHandler: ((NSPoint) -> Void)?
+    private var isDraggingAnchor = false
+
+    func configure(tintColor: NSColor, dragHandler: @escaping (NSPoint) -> Void) {
+        canShowCallout = false
+        markerTintColor = tintColor
+        glyphImage = nil
+        self.dragHandler = dragHandler
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isDraggingAnchor = true
+    }
 
     override func mouseDragged(with event: NSEvent) {
-        // Block mouse drag panning while leaving trackpad gestures alone.
+        guard isDraggingAnchor, let mapView = superview as? MKMapView else {
+            return
+        }
+        let point = mapView.convert(event.locationInWindow, from: nil)
+        dragHandler?(point)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard isDraggingAnchor, let mapView = superview as? MKMapView else {
+            isDraggingAnchor = false
+            return
+        }
+        let point = mapView.convert(event.locationInWindow, from: nil)
+        dragHandler?(point)
+        isDraggingAnchor = false
+    }
+}
+
+private final class RouteAnchorDotAnnotationView: MKAnnotationView {
+    private var dragHandler: ((NSPoint) -> Void)?
+    private var isDraggingAnchor = false
+
+    func configure(image: NSImage, dragHandler: @escaping (NSPoint) -> Void) {
+        canShowCallout = false
+        self.image = image
+        centerOffset = NSPoint(x: 0, y: -6)
+        self.dragHandler = dragHandler
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isDraggingAnchor = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDraggingAnchor, let mapView = superview as? MKMapView else {
+            return
+        }
+        let point = mapView.convert(event.locationInWindow, from: nil)
+        dragHandler?(point)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard isDraggingAnchor, let mapView = superview as? MKMapView else {
+            isDraggingAnchor = false
+            return
+        }
+        let point = mapView.convert(event.locationInWindow, from: nil)
+        dragHandler?(point)
+        isDraggingAnchor = false
     }
 }
 
