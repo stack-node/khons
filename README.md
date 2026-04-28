@@ -1,5 +1,7 @@
 # Khons
 
+![Khons banner](Resources/README-Banner.png)
+
 Khons is a macOS SwiftUI utility for simulating an iPhone's location from a desktop map. It lets you pick a target point visually, detects connected iOS devices, and applies location spoofing through the toolchain that matches the device generation:
 
 - `libimobiledevice` for older iOS versions

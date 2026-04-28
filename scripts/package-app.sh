@@ -4,8 +4,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="Khons"
-VERSION="0.0.4"
-BUILD_NUMBER="004"
+VERSION="0.0.5"
+BUILD_NUMBER="005"
 BUILD_DIR="$ROOT_DIR/.build/arm64-apple-macosx/release"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
@@ -20,12 +20,9 @@ ICON_BUNDLE_NAME="Icon"
 
 cd "$ROOT_DIR"
 mkdir -p "$MODULE_CACHE_DIR"
-
-if [[ ! -x "$BUILD_DIR/$APP_NAME" ]]; then
-  export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR"
-  export SWIFTPM_MODULECACHE_OVERRIDE="$MODULE_CACHE_DIR"
-  swift build -c release
-fi
+export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR"
+export SWIFTPM_MODULECACHE_OVERRIDE="$MODULE_CACHE_DIR"
+swift build -c release
 
 rm -rf "$APP_DIR"
 rm -rf "$ICONSET_DIR"
