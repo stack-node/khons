@@ -1,0 +1,109 @@
+# Khons
+
+Khons is a macOS SwiftUI utility for simulating an iPhone's location from a desktop map. It lets you pick a target point visually, detects connected iOS devices, and applies location spoofing through the toolchain that matches the device generation:
+
+- `libimobiledevice` for older iOS versions
+- `pymobiledevice3` developer tooling for iOS 17+
+
+The app is built as a Swift Package and provides a map-first workflow for selecting coordinates, refreshing attached devices, starting simulation, and resetting back to the device's real location.
+
+## Screenshot
+
+![Khons screenshot](Resources/Preview.png)
+
+## Features
+
+- Native macOS SwiftUI interface with MapKit
+- Click-to-select target coordinates
+- USB device detection via `idevice_id`
+- Device name lookup via `ideviceinfo`
+- Location simulation for both legacy and modern iOS tooling
+- One-click dependency bootstrap from inside the app
+
+## Requirements
+
+- macOS 14 or newer
+- Xcode Command Line Tools
+- Homebrew
+- A physical iPhone connected over USB
+- The iPhone must be unlocked and trusted by the Mac
+- For development services on newer iOS versions, opening the device once in Xcode may be required
+
+## Build
+
+Build the app from the project root:
+
+```bash
+swift build
+```
+
+Run it directly with SwiftPM:
+
+```bash
+swift run
+```
+
+## Dependency Setup
+
+Khons can install most runtime dependencies from the app UI, but you can also prepare them manually.
+
+Install the native tooling:
+
+```bash
+brew install python swig openssl@3 libimobiledevice
+```
+
+Create the Python environment used for iOS 17+ support:
+
+```bash
+python3 -m venv "$HOME/.venvs/khons-pmd3"
+source "$HOME/.venvs/khons-pmd3/bin/activate"
+python -m pip install -U pip setuptools wheel
+python -m pip install -U pymobiledevice3
+```
+
+When launching Khons for iOS 17+ simulation, use the same shell session after activating that virtual environment:
+
+```bash
+source "$HOME/.venvs/khons-pmd3/bin/activate"
+swift run
+```
+
+## Usage
+
+1. Connect an iPhone over USB and unlock it.
+2. Trust the Mac on the device if prompted.
+3. Start Khons.
+4. Refresh devices if needed.
+5. Pick the correct tool group for the target iOS version.
+6. Click on the map to choose a target location.
+7. Press the green action button to start simulation.
+8. Press the red action button to clear the simulated location.
+
+## Notes
+
+- If `idevice_id` or `idevicesetlocation` are missing, install `libimobiledevice`.
+- If no devices appear, reconnect the phone, unlock it, trust the Mac, and retry.
+- Modern iOS simulation relies on Apple developer services exposed through `pymobiledevice3`, so local environment setup matters.
+
+## License Clarification
+
+Khons is source-available, but it is not Open Source in the OSI sense.
+
+- Personal, non-commercial use is allowed.
+- Commercial use is not allowed without prior written permission from the creator.
+- You can study the code, modify it, and share improvements under the same license terms.
+- Ownership of the original project and brand remains with the creator.
+
+## License
+
+This project is distributed under the terms in [LICENSE](LICENSE).
+
+## Contributing
+
+Contributions are welcome, especially bug fixes, compatibility updates, and UX improvements.
+
+- Open an issue or submit a pull request with a clear description of the change.
+- Keep changes focused and easy to review.
+- By submitting a contribution, you agree that it may be incorporated into the project and redistributed under this repository's license.
+- Submitting a contribution does not transfer ownership of the overall project away from the creator.

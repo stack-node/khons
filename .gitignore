@@ -1,0 +1,18 @@
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+DerivedData/
+*.xcworkspace
+*.xcodeproj/project.xcworkspace/
+*.xcuserdatad/
+*.xcuserstate
+xcuserdata/
+
+# Editors
+.idea/
+.vscode/
