@@ -224,7 +224,11 @@ final class KhonsViewModel: ObservableObject {
         if effectiveResult.exitCode == 0 {
             targetCoordinate = CLLocationCoordinate2D(latitude: lat, longitude: lon)
             simulatedCoordinate = targetCoordinate
-            statusMessage = "Location set to \(lat), \(lon)."
+            if selectedToolGroup == .modernIOS {
+                statusMessage = "Location set to \(lat), \(lon). Keep Khons open while iOS 17+ simulation is active."
+            } else {
+                statusMessage = "Location set to \(lat), \(lon)."
+            }
         } else {
             let detail = [effectiveResult.stdout, effectiveResult.stderr].joined().trimmingCharacters(in: .whitespacesAndNewlines)
             statusMessage = interpretedLocationFailureMessage(

@@ -12,6 +12,7 @@ enum LocationToolRunner {
     private static var activeTunnelProcess: Process?
     private static var activeRSDHost: String?
     private static var activeRSDPort: String?
+    private static var activeTunnelUDID: String?
     
     private static func preferredPythonExecutable() -> String {
         let fm = FileManager.default
@@ -188,9 +189,16 @@ enum LocationToolRunner {
         guard preflight.exitCode == 0 else {
             return preflight
         }
-        let tunnelResult = await ensureRSDTunnel()
+        let tunnelResult = await ensureRSDTunnel(for: udid)
         guard tunnelResult.exitCode == 0 else {
             return tunnelResult
+        }
+        guard let rsdHost = activeRSDHost, let rsdPort = activeRSDPort else {
+            return RunResult(
+                exitCode: 1,
+                stdout: "",
+                stderr: "Managed iOS 17+ tunnel did not expose an RSD host/port."
+            )
         }
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -200,9 +208,12 @@ enum LocationToolRunner {
                 var args = [preferredPythonExecutable(), "-m", "pymobiledevice3"]
                 args += [
                     "developer", "dvt", "simulate-location", "set",
-                    "--tunnel", "",
-                    "--", String(latitude), String(longitude)
+                    "--rsd", rsdHost, rsdPort
                 ]
+                if let udid {
+                    args += ["--udid", udid]
+                }
+                args += ["--", String(latitude), String(longitude)]
                 process.arguments = args
                 
                 let outPipe = Pipe()
@@ -321,13 +332,23 @@ enum LocationToolRunner {
         guard preflight.exitCode == 0 else {
             return preflight
         }
-        let tunnelResult = await ensureRSDTunnel()
+        let tunnelResult = await ensureRSDTunnel(for: udid)
         guard tunnelResult.exitCode == 0 else {
             return tunnelResult
         }
+        guard let rsdHost = activeRSDHost, let rsdPort = activeRSDPort else {
+            return RunResult(
+                exitCode: 1,
+                stdout: "",
+                stderr: "Managed iOS 17+ tunnel did not expose an RSD host/port."
+            )
+        }
         
         var args: [String] = []
-        args += ["developer", "dvt", "simulate-location", "clear", "--tunnel", ""]
+        args += ["developer", "dvt", "simulate-location", "clear", "--rsd", rsdHost, rsdPort]
+        if let udid {
+            args += ["--udid", udid]
+        }
         return await runPyMobileDevice3(arguments: args)
     }
     
@@ -346,23 +367,158 @@ enum LocationToolRunner {
         return await run(executable: idevicesetlocation, arguments: args)
     }
 
-    private static func ensureRSDTunnel() async -> RunResult {
-        let probe = await runPyMobileDevice3(arguments: ["developer", "dvt", "ls", "/", "--tunnel", ""])
-        if probe.exitCode == 0 {
-            return RunResult(exitCode: 0, stdout: "tunneld already available.", stderr: "")
-        }
-        let detail = [probe.stdout, probe.stderr].joined().lowercased()
-        if detail.contains("requires root privileges") {
-            let adminStart = runAdminTunnelStart()
-            if adminStart.exitCode == 0 {
-                return RunResult(exitCode: 0, stdout: "Privileged tunneld daemon started.", stderr: "")
+    private static func ensureRSDTunnel(for udid: String?) async -> RunResult {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                if
+                    let process = activeTunnelProcess,
+                    process.isRunning,
+                    let host = activeRSDHost,
+                    let port = activeRSDPort,
+                    activeTunnelUDID == udid
+                {
+                    continuation.resume(
+                        returning: RunResult(
+                            exitCode: 0,
+                            stdout: "Reusing managed tunnel at \(host):\(port).",
+                            stderr: ""
+                        )
+                    )
+                    return
+                }
+
+                stopActiveTunnel()
+
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+
+                var args = [preferredPythonExecutable(), "-m", "pymobiledevice3", "remote", "start-tunnel", "--script-mode"]
+                if let udid, !udid.isEmpty {
+                    args += ["--udid", udid]
+                }
+                process.arguments = args
+
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                process.standardOutput = outPipe
+                process.standardError = errPipe
+
+                let outHandle = outPipe.fileHandleForReading
+                let errHandle = errPipe.fileHandleForReading
+                var stdoutBuffer = ""
+                var stderrBuffer = ""
+                let readySemaphore = DispatchSemaphore(value: 0)
+                var resolvedHost: String?
+                var resolvedPort: String?
+
+                func consume(_ text: String, isStdErr: Bool) {
+                    if isStdErr {
+                        stderrBuffer += text
+                    } else {
+                        stdoutBuffer += text
+                    }
+
+                    let lines = (stdoutBuffer + "\n" + stderrBuffer)
+                        .split(whereSeparator: \.isNewline)
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+                    for line in lines where !line.isEmpty {
+                        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+                        guard tokens.count >= 2 else { continue }
+                        let candidateHost = tokens[0]
+                        let candidatePort = tokens[1]
+                        if Int(candidatePort) != nil {
+                            resolvedHost = candidateHost
+                            resolvedPort = candidatePort
+                            readySemaphore.signal()
+                            return
+                        }
+                    }
+                }
+
+                outHandle.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                    consume(text, isStdErr: false)
+                }
+
+                errHandle.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                    consume(text, isStdErr: true)
+                }
+
+                do {
+                    try process.run()
+                    let ready = readySemaphore.wait(timeout: .now() + 15)
+
+                    if
+                        ready == .success,
+                        process.isRunning,
+                        let host = resolvedHost,
+                        let port = resolvedPort
+                    {
+                        activeTunnelProcess = process
+                        activeRSDHost = host
+                        activeRSDPort = port
+                        activeTunnelUDID = udid
+                        continuation.resume(
+                            returning: RunResult(
+                                exitCode: 0,
+                                stdout: "Managed tunnel ready at \(host):\(port).",
+                                stderr: ""
+                            )
+                        )
+                        return
+                    }
+
+                    if process.isRunning {
+                        process.terminate()
+                        process.waitUntilExit()
+                    }
+
+                    outHandle.readabilityHandler = nil
+                    errHandle.readabilityHandler = nil
+                    let trailingOut = outHandle.readDataToEndOfFile()
+                    let trailingErr = errHandle.readDataToEndOfFile()
+                    if let text = String(data: trailingOut, encoding: .utf8), !text.isEmpty {
+                        stdoutBuffer += text
+                    }
+                    if let text = String(data: trailingErr, encoding: .utf8), !text.isEmpty {
+                        stderrBuffer += text
+                    }
+
+                    let detail = [stdoutBuffer, stderrBuffer]
+                        .joined(separator: "\n")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    continuation.resume(
+                        returning: RunResult(
+                            exitCode: process.terminationStatus == 0 ? 1 : process.terminationStatus,
+                            stdout: stdoutBuffer,
+                            stderr: tunnelFailureMessage(stderr: detail)
+                        )
+                    )
+                } catch {
+                    outHandle.readabilityHandler = nil
+                    errHandle.readabilityHandler = nil
+                    continuation.resume(
+                        returning: RunResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
+                    )
+                }
             }
         }
-        return RunResult(
-            exitCode: probe.exitCode == 0 ? 1 : probe.exitCode,
-            stdout: probe.stdout,
-            stderr: tunnelFailureMessage(stderr: probe.stderr)
-        )
+    }
+
+    private static func stopActiveTunnel() {
+        if let process = activeTunnelProcess, process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+        activeTunnelProcess = nil
+        activeRSDHost = nil
+        activeRSDPort = nil
+        activeTunnelUDID = nil
     }
 
     private static func tunnelFailureMessage(stderr: String) -> String {

@@ -1,3 +1,4 @@
+import AppKit
 import MapKit
 import SwiftUI
 
@@ -10,11 +11,9 @@ private struct Preset: Identifiable {
 
 struct ContentView: View {
     @StateObject private var model = KhonsViewModel()
-    @State private var cameraPosition: MapCameraPosition = .region(
-        MKCoordinateRegion(
-            center: CLLocationCoordinate2D(latitude: 37.3349, longitude: -122.0090),
-            span: MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
-        )
+    @State private var cameraRegion = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 37.3349, longitude: -122.0090),
+        span: MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
     )
 
     private let presets: [Preset] = [
@@ -25,22 +24,17 @@ struct ContentView: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            MapReader { proxy in
-                Map(position: $cameraPosition, interactionModes: .all) {
-                    Marker("Target", coordinate: model.targetCoordinate)
-                        .tint(.blue)
-                    if let simulated = model.simulatedCoordinate {
-                        Marker("Device (simulated)", coordinate: simulated)
-                            .tint(.orange)
-                    }
+            MacMapView(
+                region: cameraRegion,
+                targetCoordinate: model.targetCoordinate,
+                simulatedCoordinate: model.simulatedCoordinate,
+                onCoordinateSelected: { coordinate in
+                    model.setTargetCoordinate(coordinate)
+                },
+                onRegionChanged: { region in
+                    cameraRegion = region
                 }
-                .mapStyle(.standard(elevation: .realistic))
-                .onTapGesture(count: 1, coordinateSpace: .local) { point in
-                    if let coordinate = proxy.convert(point, from: .local) {
-                        model.setTargetCoordinate(coordinate)
-                    }
-                }
-            }
+            )
             .ignoresSafeArea()
         }
         .overlay(alignment: .bottomLeading) {
@@ -295,19 +289,147 @@ struct ContentView: View {
     }
 
     private func centerCamera(on coordinate: CLLocationCoordinate2D) {
-        cameraPosition = .region(
-            MKCoordinateRegion(
-                center: coordinate,
-                span: MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
-            )
+        cameraRegion = MKCoordinateRegion(
+            center: coordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
         )
     }
-    
+
     private var titleCoordinateText: String {
         let coordinate = model.simulatedCoordinate ?? model.targetCoordinate
         return String(format: "Lat %.6f, Lon %.6f", coordinate.latitude, coordinate.longitude)
     }
+}
 
+private struct MacMapView: NSViewRepresentable {
+    let region: MKCoordinateRegion
+    let targetCoordinate: CLLocationCoordinate2D
+    let simulatedCoordinate: CLLocationCoordinate2D?
+    let onCoordinateSelected: (CLLocationCoordinate2D) -> Void
+    let onRegionChanged: (MKCoordinateRegion) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onRegionChanged: onRegionChanged)
+    }
+
+    func makeNSView(context: Context) -> ClickSelectableMapView {
+        let mapView = ClickSelectableMapView(frame: .zero)
+        mapView.delegate = context.coordinator
+        mapView.mapType = .standard
+        mapView.isZoomEnabled = true
+        mapView.isScrollEnabled = true
+        mapView.isPitchEnabled = false
+        mapView.isRotateEnabled = false
+        mapView.showsCompass = false
+        mapView.showsZoomControls = false
+        mapView.showsScale = false
+        mapView.onCoordinateSelected = onCoordinateSelected
+        mapView.setRegion(region, animated: false)
+        context.coordinator.syncAnnotations(on: mapView, target: targetCoordinate, simulated: simulatedCoordinate)
+        return mapView
+    }
+
+    func updateNSView(_ mapView: ClickSelectableMapView, context: Context) {
+        mapView.onCoordinateSelected = onCoordinateSelected
+        context.coordinator.onRegionChanged = onRegionChanged
+        context.coordinator.syncAnnotations(on: mapView, target: targetCoordinate, simulated: simulatedCoordinate)
+
+        if !context.coordinator.isRegion(mapView.region, approximatelyEqualTo: region) {
+            context.coordinator.isProgrammaticRegionChange = true
+            mapView.setRegion(region, animated: false)
+        }
+    }
+
+    final class Coordinator: NSObject, MKMapViewDelegate {
+        var onRegionChanged: (MKCoordinateRegion) -> Void
+
+        init(onRegionChanged: @escaping (MKCoordinateRegion) -> Void) {
+            self.onRegionChanged = onRegionChanged
+        }
+
+        var isProgrammaticRegionChange = false
+
+        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            if isProgrammaticRegionChange {
+                isProgrammaticRegionChange = false
+                return
+            }
+            let region = mapView.region
+            DispatchQueue.main.async { [onRegionChanged] in
+                onRegionChanged(region)
+            }
+        }
+
+        func syncAnnotations(on mapView: MKMapView, target: CLLocationCoordinate2D, simulated: CLLocationCoordinate2D?) {
+            let existing = mapView.annotations.filter { !($0 is MKUserLocation) }
+            mapView.removeAnnotations(existing)
+
+            let targetAnnotation = MKPointAnnotation()
+            targetAnnotation.title = "Target"
+            targetAnnotation.coordinate = target
+            mapView.addAnnotation(targetAnnotation)
+
+            if let simulated {
+                let simulatedAnnotation = MKPointAnnotation()
+                simulatedAnnotation.title = "Device (simulated)"
+                simulatedAnnotation.coordinate = simulated
+                mapView.addAnnotation(simulatedAnnotation)
+            }
+        }
+
+        func mapView(_ mapView: MKMapView, viewFor annotation: any MKAnnotation) -> MKAnnotationView? {
+            if annotation is MKUserLocation {
+                return nil
+            }
+            let identifier = "marker"
+            let view = (mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? MKMarkerAnnotationView)
+                ?? MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: identifier)
+            view.annotation = annotation
+            view.canShowCallout = false
+            view.markerTintColor = annotation.title??.contains("simulated") == true ? .systemOrange : .systemBlue
+            return view
+        }
+
+        func isRegion(_ lhs: MKCoordinateRegion, approximatelyEqualTo rhs: MKCoordinateRegion) -> Bool {
+            abs(lhs.center.latitude - rhs.center.latitude) < 0.000_001 &&
+            abs(lhs.center.longitude - rhs.center.longitude) < 0.000_001 &&
+            abs(lhs.span.latitudeDelta - rhs.span.latitudeDelta) < 0.000_001 &&
+            abs(lhs.span.longitudeDelta - rhs.span.longitudeDelta) < 0.000_001
+        }
+    }
+}
+
+private final class ClickSelectableMapView: MKMapView {
+    var onCoordinateSelected: ((CLLocationCoordinate2D) -> Void)?
+    private var mouseDownLocation: NSPoint?
+    private let clickTolerance: CGFloat = 4
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownLocation = convert(event.locationInWindow, from: nil)
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let mouseUpLocation = convert(event.locationInWindow, from: nil)
+        let shouldSelect: Bool
+        if let mouseDownLocation {
+            shouldSelect = hypot(mouseUpLocation.x - mouseDownLocation.x, mouseUpLocation.y - mouseDownLocation.y) <= clickTolerance
+        } else {
+            shouldSelect = false
+        }
+        mouseDownLocation = nil
+
+        super.mouseUp(with: event)
+
+        if shouldSelect {
+            let coordinate = convert(mouseUpLocation, toCoordinateFrom: self)
+            onCoordinateSelected?(coordinate)
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        // Block mouse drag panning while leaving trackpad gestures alone.
+    }
 }
 
 private struct RecenterButtonStyle: ButtonStyle {
