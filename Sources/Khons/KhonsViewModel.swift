@@ -119,6 +119,8 @@ final class KhonsViewModel: NSObject, ObservableObject {
     }
     @Published var routePreviewCoordinates: [CLLocationCoordinate2D] = []
     @Published var routePreviewSegments: [RoutePreviewSegment] = []
+    @Published var hoveredRouteSegmentIndex: Int?
+    @Published var hoveredRouteWaypointIndex: Int?
 
     private let travelStepCount = 40
     private let travelStepDelayNanoseconds: UInt64 = 1_000_000_000
@@ -322,6 +324,16 @@ final class KhonsViewModel: NSObject, ObservableObject {
                 self.routePreviewSegments = preview.segments
             }
         }
+    }
+
+    func setHoveredRouteSegmentIndex(_ index: Int?) {
+        hoveredRouteSegmentIndex = index
+        hoveredRouteWaypointIndex = index
+    }
+
+    func clearRouteHover() {
+        hoveredRouteSegmentIndex = nil
+        hoveredRouteWaypointIndex = nil
     }
 
     private func scheduleSearchSuggestionsRefresh() {
@@ -764,7 +776,83 @@ final class KhonsViewModel: NSObject, ObservableObject {
     }
 
     private func buildTravelPlan(from route: [CLLocationCoordinate2D]) async -> TravelPlan {
-        let mappedRoute = await mappedRouteCoordinates(from: route)
+        let mappedRoute = await mappedRouteCoordinates(from: route, includeEndBehavior: true)
+        return travelPlan(from: mappedRoute)
+    }
+
+    private struct RoutePreview {
+        let coordinates: [CLLocationCoordinate2D]
+        let segments: [RoutePreviewSegment]
+    }
+
+    private func buildRoutePreview() async -> RoutePreview {
+        let route = routeCoordinates
+        guard route.count > 1 else {
+            return RoutePreview(coordinates: route, segments: [])
+        }
+
+        let segments = await mappedRouteSegments(from: route, includeEndBehavior: true)
+        let flattened = segments.flatMap(\.coordinates)
+        return RoutePreview(
+            coordinates: flattened.isEmpty ? route : flattened,
+            segments: segments
+        )
+    }
+
+    private func mappedRouteCoordinates(from route: [CLLocationCoordinate2D], includeEndBehavior: Bool = false) async -> [CLLocationCoordinate2D] {
+        let segments = await mappedRouteSegments(from: route, includeEndBehavior: includeEndBehavior)
+        guard let first = segments.first?.coordinates.first else {
+            return route
+        }
+
+        var result: [CLLocationCoordinate2D] = [first]
+        for segment in segments {
+            guard !segment.coordinates.isEmpty else { continue }
+            result.append(contentsOf: segment.coordinates.dropFirst())
+        }
+        return result
+    }
+
+    private func mappedRouteSegments(from route: [CLLocationCoordinate2D], includeEndBehavior: Bool) async -> [RoutePreviewSegment] {
+        let previewRoute = previewRouteCoordinates(from: route, includeEndBehavior: includeEndBehavior)
+        guard previewRoute.count > 1 else {
+            return []
+        }
+
+        var segments: [RoutePreviewSegment] = []
+        for segmentIndex in 0..<(previewRoute.count - 1) {
+            let start = previewRoute[segmentIndex]
+            let end = previewRoute[segmentIndex + 1]
+            let coordinates = await mappedLegCoordinates(from: start, to: end)
+            segments.append(RoutePreviewSegment(index: segmentIndex, coordinates: coordinates))
+        }
+        return segments
+    }
+
+    private func previewRouteCoordinates(
+        from route: [CLLocationCoordinate2D],
+        includeEndBehavior: Bool
+    ) -> [CLLocationCoordinate2D] {
+        guard includeEndBehavior, route.count > 1 else {
+            return route
+        }
+
+        let origin = route[0]
+        switch selectedRouteEndBehavior {
+        case .stayAtDestination:
+            return route
+        case .returnToOrigin:
+            return route + [origin]
+        case .reverse:
+            return route + Array(route.dropLast().reversed())
+        case .loop:
+            return route + [origin]
+        case .reverseLoop:
+            return route + Array(route.dropLast().reversed())
+        }
+    }
+
+    private func travelPlan(from mappedRoute: [CLLocationCoordinate2D]) -> TravelPlan {
         let origin = mappedRoute[0]
 
         switch selectedRouteEndBehavior {
@@ -805,54 +893,6 @@ final class KhonsViewModel: NSObject, ObservableObject {
                     : "Completed \(selectedLoopCount.rawValue) of the reverse loop."
             )
         }
-    }
-
-    private struct RoutePreview {
-        let coordinates: [CLLocationCoordinate2D]
-        let segments: [RoutePreviewSegment]
-    }
-
-    private func buildRoutePreview() async -> RoutePreview {
-        let route = routeCoordinates
-        guard route.count > 1 else {
-            return RoutePreview(coordinates: route, segments: [])
-        }
-
-        let segments = await mappedRouteSegments(from: route)
-        let flattened = segments.flatMap(\.coordinates)
-        return RoutePreview(
-            coordinates: flattened.isEmpty ? route : flattened,
-            segments: segments
-        )
-    }
-
-    private func mappedRouteCoordinates(from route: [CLLocationCoordinate2D]) async -> [CLLocationCoordinate2D] {
-        let segments = await mappedRouteSegments(from: route)
-        guard let first = segments.first?.coordinates.first else {
-            return route
-        }
-
-        var result: [CLLocationCoordinate2D] = [first]
-        for segment in segments {
-            guard !segment.coordinates.isEmpty else { continue }
-            result.append(contentsOf: segment.coordinates.dropFirst())
-        }
-        return result
-    }
-
-    private func mappedRouteSegments(from route: [CLLocationCoordinate2D]) async -> [RoutePreviewSegment] {
-        guard route.count > 1 else {
-            return []
-        }
-
-        var segments: [RoutePreviewSegment] = []
-        for segmentIndex in 0..<(route.count - 1) {
-            let start = route[segmentIndex]
-            let end = route[segmentIndex + 1]
-            let coordinates = await mappedLegCoordinates(from: start, to: end)
-            segments.append(RoutePreviewSegment(index: segmentIndex, coordinates: coordinates))
-        }
-        return segments
     }
 
     private func mappedLegCoordinates(

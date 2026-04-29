@@ -4,8 +4,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="Khons"
-VERSION="0.0.7"
-BUILD_NUMBER="007"
+VERSION="0.0.8"
+BUILD_NUMBER="008"
 BUILD_DIR="$ROOT_DIR/.build/arm64-apple-macosx/release"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
@@ -144,6 +144,34 @@ EOF
       swift "$ICON_SETTER" "$ICON_SOURCE" "$APP_DIR" >/dev/null
     rm -f "$ICON_SETTER"
   fi
+
+  ICON_SETTER="$(mktemp "$DIST_DIR/icon-setter.XXXXXX.swift")"
+  cat > "$ICON_SETTER" <<'EOF'
+import AppKit
+import Foundation
+
+let arguments = CommandLine.arguments
+guard arguments.count == 3 else {
+    fputs("Usage: icon-setter <source> <bundle>\n", stderr)
+    exit(1)
+}
+
+let sourceURL = URL(fileURLWithPath: arguments[1])
+guard let image = NSImage(contentsOf: sourceURL) else {
+    fputs("Unable to read source image.\n", stderr)
+    exit(1)
+}
+
+let bundlePath = arguments[2]
+guard NSWorkspace.shared.setIcon(image, forFile: bundlePath, options: []) else {
+    fputs("Unable to assign bundle icon.\n", stderr)
+    exit(1)
+}
+EOF
+
+  env CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR" SWIFTPM_MODULECACHE_OVERRIDE="$MODULE_CACHE_DIR" \
+    swift "$ICON_SETTER" "$ICON_SOURCE" "$APP_DIR" >/dev/null
+  rm -f "$ICON_SETTER"
 fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<EOF
