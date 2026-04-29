@@ -1,9 +1,10 @@
 import Combine
 import CoreLocation
 import Foundation
+import MapKit
 
 @MainActor
-final class KhonsViewModel: ObservableObject {
+final class KhonsViewModel: NSObject, ObservableObject {
     enum RouteAnchorLock: Equatable {
         case target
         case waypoint(Int)
@@ -45,6 +46,36 @@ final class KhonsViewModel: ObservableObject {
         }
     }
 
+    enum WaypointMappingMode: String, CaseIterable, Identifiable {
+        case simple = "Simple"
+        case advancedWalk = "Advanced walk"
+        case advancedDrive = "Advanced drive"
+        case advancedCombined = "Advanced combined"
+
+        var id: String { rawValue }
+    }
+
+    struct SearchSuggestion: Identifiable, Equatable {
+        var id: String { "\(title)|\(subtitle)" }
+        let title: String
+        let subtitle: String
+
+        var query: String {
+            subtitle.isEmpty ? title : "\(title), \(subtitle)"
+        }
+
+        var displayText: String {
+            subtitle.isEmpty ? title : "\(title) \(subtitle)"
+        }
+    }
+
+    struct RoutePreviewSegment: Identifiable {
+        let index: Int
+        let coordinates: [CLLocationCoordinate2D]
+
+        var id: Int { index }
+    }
+
     enum ToolGroup: String, CaseIterable, Identifiable {
         case legacyIOS = "< iOS 17"
         case modernIOS = ">= iOS 17"
@@ -56,6 +87,13 @@ final class KhonsViewModel: ObservableObject {
     @Published var selectedUDID: String?
     @Published var latitudeText = "37.3349"
     @Published var longitudeText = "-122.0090"
+    @Published var searchText = "" {
+        didSet {
+            scheduleSearchSuggestionsRefresh()
+        }
+    }
+    @Published var isSearching = false
+    @Published var searchSuggestions: [SearchSuggestion] = []
     @Published var statusMessage = ""
     @Published var isBusy = false
     @Published var busyTitle = ""
@@ -74,13 +112,28 @@ final class KhonsViewModel: ObservableObject {
     @Published var lockedRouteAnchor: RouteAnchorLock?
     @Published var selectedRouteEndBehavior: RouteEndBehavior = .stayAtDestination
     @Published var selectedLoopCount: LoopCountOption = .infinite
+    @Published var selectedWaypointMapping: WaypointMappingMode = .simple {
+        didSet {
+            scheduleRoutePreviewRefresh()
+        }
+    }
+    @Published var routePreviewCoordinates: [CLLocationCoordinate2D] = []
+    @Published var routePreviewSegments: [RoutePreviewSegment] = []
 
     private let travelStepCount = 40
     private let travelStepDelayNanoseconds: UInt64 = 1_000_000_000
     private var travelTask: Task<Void, Never>?
+    private var routePreviewTask: Task<Void, Never>?
+    private var searchSuggestionsTask: Task<Void, Never>?
+    private let searchCompleter = MKLocalSearchCompleter()
 
-    init() {
+    override init() {
+        super.init()
+        searchCompleter.delegate = self
+        searchCompleter.resultTypes = [.address, .pointOfInterest]
         refreshToolPaths()
+        scheduleRoutePreviewRefresh()
+        scheduleSearchSuggestionsRefresh()
     }
 
     func refreshToolPaths() {
@@ -206,6 +259,7 @@ final class KhonsViewModel: ObservableObject {
         latitudeText = formatCoord(latitude)
         longitudeText = formatCoord(longitude)
         targetCoordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        scheduleRoutePreviewRefresh()
     }
 
     func setTargetCoordinate(_ coordinate: CLLocationCoordinate2D) {
@@ -215,6 +269,7 @@ final class KhonsViewModel: ObservableObject {
         targetCoordinate = coordinate
         latitudeText = formatCoord(coordinate.latitude)
         longitudeText = formatCoord(coordinate.longitude)
+        scheduleRoutePreviewRefresh()
     }
 
     func handleMapCoordinateSelection(_ coordinate: CLLocationCoordinate2D) {
@@ -256,6 +311,38 @@ final class KhonsViewModel: ObservableObject {
         }
     }
 
+    private func scheduleRoutePreviewRefresh() {
+        routePreviewTask?.cancel()
+        routePreviewTask = Task { [weak self] in
+            guard let self else { return }
+            let preview = await self.buildRoutePreview()
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self.routePreviewCoordinates = preview.coordinates
+                self.routePreviewSegments = preview.segments
+            }
+        }
+    }
+
+    private func scheduleSearchSuggestionsRefresh() {
+        searchSuggestionsTask?.cancel()
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            searchSuggestions = []
+            searchCompleter.queryFragment = ""
+            return
+        }
+
+        searchSuggestionsTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self.searchCompleter.queryFragment = query
+            }
+        }
+    }
+
     func setTravelCoordinate(after anchorIndex: Int?, to coordinate: CLLocationCoordinate2D) {
         guard isValidCoordinate(latitude: coordinate.latitude, longitude: coordinate.longitude) else {
             return
@@ -266,6 +353,7 @@ final class KhonsViewModel: ObservableObject {
         } else {
             travelCoordinates.append(coordinate)
         }
+        scheduleRoutePreviewRefresh()
     }
 
     func removeTravelCoordinate(at index: Int) {
@@ -281,6 +369,7 @@ final class KhonsViewModel: ObservableObject {
         default:
             break
         }
+        scheduleRoutePreviewRefresh()
     }
 
     var hasTravelRoute: Bool {
@@ -303,7 +392,38 @@ final class KhonsViewModel: ObservableObject {
         else {
             return
         }
-        targetCoordinate = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        setTargetCoordinate(CLLocationCoordinate2D(latitude: lat, longitude: lon))
+    }
+
+    func searchLocation() async -> CLLocationCoordinate2D? {
+        await searchLocation(using: searchText)
+    }
+
+    func searchLocation(using query: String) async -> CLLocationCoordinate2D? {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            statusMessage = "Enter a location or address to search."
+            return nil
+        }
+
+        isSearching = true
+        statusMessage = "Searching for “\(query)”…"
+
+        let results = await geocodeAddress(query)
+        isSearching = false
+
+        guard let coordinate = results.first?.location?.coordinate else {
+            statusMessage = "No matching location found for “\(query)”."
+            return nil
+        }
+
+        statusMessage = "Found “\(query)” at \(coordinate.latitude), \(coordinate.longitude)."
+        return coordinate
+    }
+
+    func selectSearchSuggestion(_ suggestion: SearchSuggestion) async -> CLLocationCoordinate2D? {
+        searchText = suggestion.displayText
+        return await searchLocation(using: suggestion.query)
     }
 
     func setSimulatedLocation() async {
@@ -326,13 +446,13 @@ final class KhonsViewModel: ObservableObject {
         }
 
         if hasTravelRoute {
-            startTravel()
+            await startTravel()
         } else {
             await setStaticSimulatedLocation(to: target)
         }
     }
 
-    func startTravel() {
+    func startTravel() async {
         let route = routeCoordinates
         guard route.count > 1 else {
             statusMessage = "Create a travel point by dragging out from the target pin."
@@ -347,7 +467,7 @@ final class KhonsViewModel: ObservableObject {
         isTravelPaused = false
         statusMessage = "Starting travel simulation…"
 
-        let plan = buildTravelPlan(from: route)
+        let plan = await buildTravelPlan(from: route)
         let initialState = travelState(for: simulatedCoordinate, path: plan.path)
 
         travelTask = Task { [weak self] in
@@ -637,35 +757,38 @@ final class KhonsViewModel: ObservableObject {
         return (bestSegmentIndex, bestProgress)
     }
 
-    private func buildTravelPlan(from route: [CLLocationCoordinate2D]) -> (
-        path: [CLLocationCoordinate2D],
-        repeatsInfinitely: Bool,
-        completionMessage: String
-    ) {
-        let origin = route[0]
+    private struct TravelPlan {
+        let path: [CLLocationCoordinate2D]
+        let repeatsInfinitely: Bool
+        let completionMessage: String
+    }
+
+    private func buildTravelPlan(from route: [CLLocationCoordinate2D]) async -> TravelPlan {
+        let mappedRoute = await mappedRouteCoordinates(from: route)
+        let origin = mappedRoute[0]
 
         switch selectedRouteEndBehavior {
         case .stayAtDestination:
-            return (
-                path: route,
+            return TravelPlan(
+                path: mappedRoute,
                 repeatsInfinitely: false,
                 completionMessage: "Arrived at the final destination."
             )
         case .returnToOrigin:
-            return (
-                path: route + [origin],
+            return TravelPlan(
+                path: mappedRoute + [origin],
                 repeatsInfinitely: false,
                 completionMessage: "Returned to the route origin."
             )
         case .reverse:
-            return (
-                path: route + Array(route.dropLast().reversed()),
+            return TravelPlan(
+                path: mappedRoute + Array(mappedRoute.dropLast().reversed()),
                 repeatsInfinitely: false,
                 completionMessage: "Ran the route in reverse back to the origin."
             )
         case .loop:
-            let cycle = route + [origin]
-            return (
+            let cycle = mappedRoute + [origin]
+            return TravelPlan(
                 path: repeatedPath(from: cycle, count: selectedLoopCount.cycleCount),
                 repeatsInfinitely: selectedLoopCount.cycleCount == nil,
                 completionMessage: selectedLoopCount.cycleCount == nil
@@ -673,14 +796,134 @@ final class KhonsViewModel: ObservableObject {
                     : "Completed \(selectedLoopCount.rawValue) of the route loop."
             )
         case .reverseLoop:
-            let cycle = route + Array(route.dropLast().reversed())
-            return (
+            let cycle = mappedRoute + Array(mappedRoute.dropLast().reversed())
+            return TravelPlan(
                 path: repeatedPath(from: cycle, count: selectedLoopCount.cycleCount),
                 repeatsInfinitely: selectedLoopCount.cycleCount == nil,
                 completionMessage: selectedLoopCount.cycleCount == nil
                     ? "Reverse looping route."
                     : "Completed \(selectedLoopCount.rawValue) of the reverse loop."
             )
+        }
+    }
+
+    private struct RoutePreview {
+        let coordinates: [CLLocationCoordinate2D]
+        let segments: [RoutePreviewSegment]
+    }
+
+    private func buildRoutePreview() async -> RoutePreview {
+        let route = routeCoordinates
+        guard route.count > 1 else {
+            return RoutePreview(coordinates: route, segments: [])
+        }
+
+        let segments = await mappedRouteSegments(from: route)
+        let flattened = segments.flatMap(\.coordinates)
+        return RoutePreview(
+            coordinates: flattened.isEmpty ? route : flattened,
+            segments: segments
+        )
+    }
+
+    private func mappedRouteCoordinates(from route: [CLLocationCoordinate2D]) async -> [CLLocationCoordinate2D] {
+        let segments = await mappedRouteSegments(from: route)
+        guard let first = segments.first?.coordinates.first else {
+            return route
+        }
+
+        var result: [CLLocationCoordinate2D] = [first]
+        for segment in segments {
+            guard !segment.coordinates.isEmpty else { continue }
+            result.append(contentsOf: segment.coordinates.dropFirst())
+        }
+        return result
+    }
+
+    private func mappedRouteSegments(from route: [CLLocationCoordinate2D]) async -> [RoutePreviewSegment] {
+        guard route.count > 1 else {
+            return []
+        }
+
+        var segments: [RoutePreviewSegment] = []
+        for segmentIndex in 0..<(route.count - 1) {
+            let start = route[segmentIndex]
+            let end = route[segmentIndex + 1]
+            let coordinates = await mappedLegCoordinates(from: start, to: end)
+            segments.append(RoutePreviewSegment(index: segmentIndex, coordinates: coordinates))
+        }
+        return segments
+    }
+
+    private func mappedLegCoordinates(
+        from start: CLLocationCoordinate2D,
+        to end: CLLocationCoordinate2D
+    ) async -> [CLLocationCoordinate2D] {
+        switch selectedWaypointMapping {
+        case .simple:
+            return [start, end]
+        case .advancedWalk:
+            return await directionsPath(from: start, to: end, transportType: .walking) ?? [start, end]
+        case .advancedDrive:
+            return await directionsPath(from: start, to: end, transportType: .automobile) ?? [start, end]
+        case .advancedCombined:
+            let walking = await directionsPath(from: start, to: end, transportType: .walking)
+            let driving = await directionsPath(from: start, to: end, transportType: .automobile)
+            switch (walking, driving) {
+            case let (walking?, driving?):
+                return combineMappedPaths(walking, driving)
+            case let (walking?, nil):
+                return walking
+            case let (nil, driving?):
+                return driving
+            default:
+                return [start, end]
+            }
+        }
+    }
+
+    private func combineMappedPaths(
+        _ walking: [CLLocationCoordinate2D],
+        _ driving: [CLLocationCoordinate2D]
+    ) -> [CLLocationCoordinate2D] {
+        guard !walking.isEmpty else { return driving }
+        guard !driving.isEmpty else { return walking }
+
+        var path = walking
+        if let last = path.last, let first = driving.first, last.latitude == first.latitude, last.longitude == first.longitude {
+            path.append(contentsOf: driving.dropFirst())
+        } else {
+            path.append(contentsOf: driving)
+        }
+        return path
+    }
+
+    private func directionsPath(
+        from start: CLLocationCoordinate2D,
+        to end: CLLocationCoordinate2D,
+        transportType: MKDirectionsTransportType
+    ) async -> [CLLocationCoordinate2D]? {
+        let request = MKDirections.Request()
+        request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
+        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: end))
+        request.transportType = transportType
+        request.requestsAlternateRoutes = false
+
+        return await withCheckedContinuation { continuation in
+            MKDirections(request: request).calculate { response, _ in
+                guard let route = response?.routes.first else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let polyline = route.polyline
+                guard polyline.pointCount > 0 else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                let points = polyline.points()
+                let coordinates = (0..<polyline.pointCount).map { points[$0].coordinate }
+                continuation.resume(returning: coordinates)
+            }
         }
     }
 
@@ -743,6 +986,15 @@ final class KhonsViewModel: ObservableObject {
         }
     }
 
+    private func geocodeAddress(_ query: String) async -> [CLPlacemark] {
+        await withCheckedContinuation { continuation in
+            let geocoder = CLGeocoder()
+            geocoder.geocodeAddressString(query) { placemarks, _ in
+                continuation.resume(returning: placemarks ?? [])
+            }
+        }
+    }
+
     private func areDependenciesInstalled() -> Bool {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
@@ -764,5 +1016,22 @@ final class KhonsViewModel: ObservableObject {
             return selectedUDID
         }
         return selectedUDID ?? deviceUDIDs.first
+    }
+}
+
+extension KhonsViewModel: MKLocalSearchCompleterDelegate {
+    nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
+        let suggestions = completer.results.map {
+            SearchSuggestion(title: $0.title, subtitle: $0.subtitle)
+        }
+        Task { @MainActor [suggestions] in
+            self.searchSuggestions = suggestions
+        }
+    }
+
+    nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
+        Task { @MainActor in
+            self.searchSuggestions = []
+        }
     }
 }
