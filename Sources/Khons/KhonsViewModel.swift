@@ -121,6 +121,9 @@ final class KhonsViewModel: NSObject, ObservableObject {
     @Published var routePreviewSegments: [RoutePreviewSegment] = []
     @Published var hoveredRouteSegmentIndex: Int?
     @Published var hoveredRouteWaypointIndex: Int?
+    @Published var activeTravelSegmentIndex: Int?
+    @Published var activeTravelSegmentProgress: Double = 0
+    @Published var activeTravelSegmentCount: Int = 0
 
     private let travelStepCount = 40
     private let travelStepDelayNanoseconds: UInt64 = 1_000_000_000
@@ -336,6 +339,40 @@ final class KhonsViewModel: NSObject, ObservableObject {
         hoveredRouteWaypointIndex = nil
     }
 
+    var routeProgressFraction: Double {
+        guard activeTravelSegmentCount > 0 else {
+            return 0
+        }
+        let segmentIndex = Double(activeTravelSegmentIndex ?? 0)
+        let fraction = (segmentIndex + activeTravelSegmentProgress) / Double(activeTravelSegmentCount)
+        return min(1, max(0, fraction))
+    }
+
+    var routeProgressBannerTitle: String? {
+        guard activeTravelSegmentCount > 0 else {
+            return nil
+        }
+        if isTraveling {
+            return "Traveling route"
+        }
+        if isTravelPaused {
+            return "Route paused"
+        }
+        if simulatedCoordinate != nil {
+            return "Route complete"
+        }
+        return "Route progress"
+    }
+
+    var routeProgressBannerSubtitle: String? {
+        guard activeTravelSegmentCount > 0 else {
+            return nil
+        }
+        let segmentNumber = min((activeTravelSegmentIndex ?? 0) + 1, activeTravelSegmentCount)
+        let percent = Int((routeProgressFraction * 100).rounded())
+        return "Leg \(segmentNumber) of \(activeTravelSegmentCount) • \(percent)%"
+    }
+
     private func scheduleSearchSuggestionsRefresh() {
         searchSuggestionsTask?.cancel()
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -435,7 +472,11 @@ final class KhonsViewModel: NSObject, ObservableObject {
 
     func selectSearchSuggestion(_ suggestion: SearchSuggestion) async -> CLLocationCoordinate2D? {
         searchText = suggestion.displayText
-        return await searchLocation(using: suggestion.query)
+        guard let coordinate = await searchLocation(using: suggestion.query) else {
+            return nil
+        }
+        setTargetCoordinate(coordinate)
+        return coordinate
     }
 
     func setSimulatedLocation() async {
@@ -481,6 +522,9 @@ final class KhonsViewModel: NSObject, ObservableObject {
 
         let plan = await buildTravelPlan(from: route)
         let initialState = travelState(for: simulatedCoordinate, path: plan.path)
+        activeTravelSegmentCount = max(plan.path.count - 1, 0)
+        activeTravelSegmentIndex = initialState.segmentIndex
+        activeTravelSegmentProgress = initialState.progress
 
         travelTask = Task { [weak self] in
             guard let self else { return }
@@ -514,6 +558,9 @@ final class KhonsViewModel: NSObject, ObservableObject {
         if effectiveResult.exitCode == 0 {
             targetCoordinate = coordinate
             simulatedCoordinate = coordinate
+            activeTravelSegmentIndex = nil
+            activeTravelSegmentProgress = 0
+            activeTravelSegmentCount = 0
             isTravelPaused = false
             if selectedToolGroup == .modernIOS {
                 statusMessage = """
@@ -546,11 +593,14 @@ final class KhonsViewModel: NSObject, ObservableObject {
 
         var segmentIndex = initialSegmentIndex
         var progress = initialProgress
+        activeTravelSegmentCount = max(path.count - 1, 0)
 
         if simulatedCoordinate == nil {
             let initialResult = await applyLocationSimulation(to: path[0])
             if initialResult.exitCode == 0 {
                 simulatedCoordinate = path[0]
+                activeTravelSegmentIndex = segmentIndex
+                activeTravelSegmentProgress = progress
             } else {
                 finishTravelWithError(initialResult)
                 return
@@ -571,6 +621,8 @@ final class KhonsViewModel: NSObject, ObservableObject {
             }
 
             simulatedCoordinate = nextCoordinate
+            activeTravelSegmentIndex = segmentIndex
+            activeTravelSegmentProgress = progress
             statusMessage = """
             Traveling… \(coordinateDescription(for: nextCoordinate))
             """
@@ -619,6 +671,11 @@ final class KhonsViewModel: NSObject, ObservableObject {
         travelTask = nil
         isTraveling = false
         isTravelPaused = markPaused
+        if !markPaused {
+            activeTravelSegmentIndex = nil
+            activeTravelSegmentProgress = 0
+            activeTravelSegmentCount = 0
+        }
     }
 
     private func validateSimulationTargetSelection() -> Bool {
@@ -687,6 +744,9 @@ final class KhonsViewModel: NSObject, ObservableObject {
         isBusy = false
         if effectiveResult.exitCode == 0 {
             simulatedCoordinate = nil
+            activeTravelSegmentIndex = nil
+            activeTravelSegmentProgress = 0
+            activeTravelSegmentCount = 0
             isTravelPaused = false
             statusMessage = "Location simulation reset."
         } else {

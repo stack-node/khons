@@ -34,6 +34,7 @@ struct ContentView: View {
                 simulatedCoordinate: model.simulatedCoordinate,
                 selectedWaypointMapping: model.selectedWaypointMapping,
                 hoveredRouteSegmentIndex: model.hoveredRouteSegmentIndex,
+                activeTravelSegmentIndex: model.activeTravelSegmentIndex,
                 onCoordinateSelected: { coordinate in
                     model.handleMapCoordinateSelection(coordinate)
                 },
@@ -495,12 +496,34 @@ struct ContentView: View {
                 }
             }
 
+            if let title = model.routeProgressBannerTitle,
+               let subtitle = model.routeProgressBannerSubtitle {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Label(title, systemImage: "location.fill")
+                            .font(.caption.weight(.semibold))
+                            .labelStyle(.titleAndIcon)
+                        Spacer(minLength: 0)
+                        Text("\(Int((model.routeProgressFraction * 100).rounded()))%")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(subtitle)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    ProgressView(value: model.routeProgressFraction)
+                        .tint(.teal)
+                }
+                .padding(10)
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
             HStack(spacing: 8) {
                 Button {
                     centerCamera(on: model.targetCoordinate)
                 } label: {
                     routeRowLabel(
-                        title: "Target",
+                        title: "Origin",
                         detail: model.coordinateDescription(for: model.targetCoordinate),
                         tint: .blue,
                         isLocked: model.isRouteAnchorLocked(.target),
@@ -663,6 +686,7 @@ struct ContentView: View {
 
     private func runSearchAndCenter() async {
         if let coordinate = await model.searchLocation() {
+            model.setTargetCoordinate(coordinate)
             centerCamera(on: coordinate, spanDelta: 0.16, animated: true)
         }
     }
@@ -683,6 +707,7 @@ private struct MacMapView: NSViewRepresentable {
     let simulatedCoordinate: CLLocationCoordinate2D?
     let selectedWaypointMapping: KhonsViewModel.WaypointMappingMode
     let hoveredRouteSegmentIndex: Int?
+    let activeTravelSegmentIndex: Int?
     let onCoordinateSelected: (CLLocationCoordinate2D) -> Void
     let onRouteHoverChanged: (Int?) -> Void
     let onTravelCoordinateUpdated: (Int?, CLLocationCoordinate2D) -> Void
@@ -711,6 +736,7 @@ private struct MacMapView: NSViewRepresentable {
         mapView.routePreviewSegments = routePreviewSegments
         mapView.selectedWaypointMapping = selectedWaypointMapping
         mapView.hoveredRouteSegmentIndex = hoveredRouteSegmentIndex
+        mapView.activeTravelSegmentIndex = activeTravelSegmentIndex
         mapView.onRouteHoverChanged = onRouteHoverChanged
         mapView.isUpdatingRouteOverlays = context.coordinator.isUpdatingRouteOverlays
         mapView.setRegion(region, animated: false)
@@ -722,6 +748,7 @@ private struct MacMapView: NSViewRepresentable {
             routePreviewSegments: routePreviewSegments,
             selectedWaypointMapping: selectedWaypointMapping,
             hoveredRouteSegmentIndex: hoveredRouteSegmentIndex,
+            activeTravelSegmentIndex: activeTravelSegmentIndex,
             simulated: simulatedCoordinate
         )
         return mapView
@@ -736,6 +763,7 @@ private struct MacMapView: NSViewRepresentable {
         mapView.routePreviewSegments = routePreviewSegments
         mapView.selectedWaypointMapping = selectedWaypointMapping
         mapView.hoveredRouteSegmentIndex = hoveredRouteSegmentIndex
+        mapView.activeTravelSegmentIndex = activeTravelSegmentIndex
         mapView.onRouteHoverChanged = onRouteHoverChanged
         mapView.isUpdatingRouteOverlays = context.coordinator.isUpdatingRouteOverlays
         context.coordinator.onRegionChanged = onRegionChanged
@@ -756,10 +784,14 @@ private struct MacMapView: NSViewRepresentable {
                 routePreviewSegments: routePreviewSegments,
                 selectedWaypointMapping: selectedWaypointMapping,
                 hoveredRouteSegmentIndex: hoveredRouteSegmentIndex,
+                activeTravelSegmentIndex: activeTravelSegmentIndex,
                 simulated: simulatedCoordinate
             )
         } else {
-            context.coordinator.refreshRouteRenderers(hoveredIndex: hoveredRouteSegmentIndex)
+            context.coordinator.refreshRouteRenderers(
+                hoveredIndex: hoveredRouteSegmentIndex,
+                activeIndex: activeTravelSegmentIndex
+            )
         }
 
         if !context.coordinator.isRegion(mapView.region, approximatelyEqualTo: region) {
@@ -806,8 +838,10 @@ private struct MacMapView: NSViewRepresentable {
             routePreviewSegments: [KhonsViewModel.RoutePreviewSegment],
             selectedWaypointMapping: KhonsViewModel.WaypointMappingMode,
             hoveredRouteSegmentIndex: Int?,
+            activeTravelSegmentIndex: Int?,
             simulated: CLLocationCoordinate2D?
         ) {
+            _ = activeTravelSegmentIndex
             let existing = mapView.annotations.filter { !($0 is MKUserLocation) }
             mapView.removeAnnotations(existing)
             let overlays = mapView.overlays
@@ -820,7 +854,7 @@ private struct MacMapView: NSViewRepresentable {
             self.selectedWaypointMapping = selectedWaypointMapping
             (mapView as? ClickSelectableMapView)?.routePreviewSegments = routePreviewSegments
 
-            let targetAnnotation = RoutePinAnnotation(kind: .target, title: "Target", coordinate: target)
+            let targetAnnotation = RoutePinAnnotation(kind: .target, title: "Origin", coordinate: target)
             mapView.addAnnotation(targetAnnotation)
 
             for (index, coordinate) in travelCoordinates.enumerated() {
@@ -953,7 +987,12 @@ private struct MacMapView: NSViewRepresentable {
             }
             let segmentIndex = segmentIndexByOverlayID[ObjectIdentifier(polyline)] ?? 0
             let renderer = MKPolylineRenderer(polyline: polyline)
-            configureRouteRenderer(renderer, segmentIndex: segmentIndex, hoveredIndex: (mapView as? ClickSelectableMapView)?.hoveredRouteSegmentIndex)
+            configureRouteRenderer(
+                renderer,
+                segmentIndex: segmentIndex,
+                hoveredIndex: (mapView as? ClickSelectableMapView)?.hoveredRouteSegmentIndex,
+                activeIndex: (mapView as? ClickSelectableMapView)?.activeTravelSegmentIndex
+            )
             renderersByOverlayID[ObjectIdentifier(polyline)] = renderer
             return renderer
         }
@@ -983,37 +1022,45 @@ private struct MacMapView: NSViewRepresentable {
         private func configureRouteRenderer(
             _ renderer: MKPolylineRenderer,
             segmentIndex: Int,
-            hoveredIndex: Int?
+            hoveredIndex: Int?,
+            activeIndex: Int?
         ) {
             let isHovered = hoveredIndex == segmentIndex
+            let isActive = activeIndex == segmentIndex
+            let isHighlighted = isHovered || isActive
             switch selectedWaypointMapping {
             case .simple:
-                renderer.strokeColor = isHovered ? .systemTeal : .systemTeal.withAlphaComponent(0.55)
-                renderer.lineWidth = isHovered ? 4 : 2
+                renderer.strokeColor = isHighlighted ? .systemTeal : .systemTeal.withAlphaComponent(0.55)
+                renderer.lineWidth = isHovered ? 5 : isActive ? 4 : 2
                 renderer.lineDashPattern = [5, 4]
-                renderer.alpha = isHovered ? 1.0 : 0.85
+                renderer.alpha = isHighlighted ? 1.0 : 0.85
             case .advancedWalk:
-                renderer.strokeColor = isHovered ? .systemGreen : .systemGreen.withAlphaComponent(0.55)
-                renderer.lineWidth = isHovered ? 6 : 3.5
+                renderer.strokeColor = isHighlighted ? .systemGreen : .systemGreen.withAlphaComponent(0.55)
+                renderer.lineWidth = isHovered ? 7 : isActive ? 6 : 3.5
                 renderer.lineDashPattern = nil
-                renderer.alpha = isHovered ? 1.0 : 0.8
+                renderer.alpha = isHighlighted ? 1.0 : 0.8
             case .advancedDrive:
-                renderer.strokeColor = isHovered ? .systemOrange : .systemOrange.withAlphaComponent(0.55)
-                renderer.lineWidth = isHovered ? 6 : 3.5
+                renderer.strokeColor = isHighlighted ? .systemOrange : .systemOrange.withAlphaComponent(0.55)
+                renderer.lineWidth = isHovered ? 7 : isActive ? 6 : 3.5
                 renderer.lineDashPattern = nil
-                renderer.alpha = isHovered ? 1.0 : 0.8
+                renderer.alpha = isHighlighted ? 1.0 : 0.8
             case .advancedCombined:
-                renderer.strokeColor = isHovered ? .systemPurple : .systemPurple.withAlphaComponent(0.55)
-                renderer.lineWidth = isHovered ? 6 : 4
+                renderer.strokeColor = isHighlighted ? .systemPurple : .systemPurple.withAlphaComponent(0.55)
+                renderer.lineWidth = isHovered ? 7 : isActive ? 6 : 4
                 renderer.lineDashPattern = [8, 3]
-                renderer.alpha = isHovered ? 1.0 : 0.85
+                renderer.alpha = isHighlighted ? 1.0 : 0.85
             }
         }
 
-        func refreshRouteRenderers(hoveredIndex: Int?) {
+        func refreshRouteRenderers(hoveredIndex: Int?, activeIndex: Int?) {
             for (overlayID, renderer) in renderersByOverlayID {
                 let segmentIndex = segmentIndexByOverlayID[overlayID] ?? 0
-                configureRouteRenderer(renderer, segmentIndex: segmentIndex, hoveredIndex: hoveredIndex)
+                configureRouteRenderer(
+                    renderer,
+                    segmentIndex: segmentIndex,
+                    hoveredIndex: hoveredIndex,
+                    activeIndex: activeIndex
+                )
                 renderer.setNeedsDisplay()
             }
         }
@@ -1071,6 +1118,12 @@ private final class ClickSelectableMapView: MKMapView {
     var routePreviewSegments: [KhonsViewModel.RoutePreviewSegment] = []
     var selectedWaypointMapping: KhonsViewModel.WaypointMappingMode = .simple
     var isUpdatingRouteOverlays = false
+    var activeTravelSegmentIndex: Int? {
+        didSet {
+            guard oldValue != activeTravelSegmentIndex, !isUpdatingRouteOverlays else { return }
+            refreshRouteOverlayRendering()
+        }
+    }
     var hoveredRouteSegmentIndex: Int? {
         didSet {
             guard oldValue != hoveredRouteSegmentIndex, !isUpdatingRouteOverlays else { return }
@@ -1223,7 +1276,10 @@ private final class ClickSelectableMapView: MKMapView {
 
     private func refreshRouteOverlayRendering() {
         guard !isUpdatingRouteOverlays else { return }
-        (delegate as? MacMapView.Coordinator)?.refreshRouteRenderers(hoveredIndex: hoveredRouteSegmentIndex)
+        (delegate as? MacMapView.Coordinator)?.refreshRouteRenderers(
+            hoveredIndex: hoveredRouteSegmentIndex,
+            activeIndex: activeTravelSegmentIndex
+        )
         setNeedsDisplay(bounds)
     }
 
